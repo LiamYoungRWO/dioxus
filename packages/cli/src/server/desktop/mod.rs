@@ -23,11 +23,11 @@ use crate::plugin::PluginManager;
 
 use super::HotReloadState;
 
-pub async fn startup(config: CrateConfig, serve: &ConfigOptsServe) -> Result<()> {
-    startup_with_platform::<DesktopPlatform>(config, serve).await
+pub fn startup(config: CrateConfig, serve: &ConfigOptsServe) -> Result<()> {
+    startup_with_platform::<DesktopPlatform>(config, serve)
 }
 
-pub(crate) async fn startup_with_platform<P: Platform + Send + 'static>(
+pub(crate) fn startup_with_platform<P: Platform + Send + 'static>(
     config: CrateConfig,
     serve_cfg: &ConfigOptsServe,
 ) -> Result<()> {
@@ -54,7 +54,7 @@ pub(crate) async fn startup_with_platform<P: Platform + Send + 'static>(
         file_map,
     };
 
-    serve::<P>(config, serve_cfg, hot_reload_state).await?;
+    serve::<P>(config, serve_cfg, hot_reload_state)?;
 
     Ok(())
 }
@@ -70,53 +70,55 @@ fn set_ctrl_c(config: &CrateConfig) {
 }
 
 /// Start the server without hot reload
-async fn serve<P: Platform + Send + 'static>(
+fn serve<P: Platform + Send + 'static>(
     config: CrateConfig,
     serve: &ConfigOptsServe,
     hot_reload_state: HotReloadState,
 ) -> Result<()> {
-    let hot_reload: tokio::task::JoinHandle<Result<()>> = tokio::spawn({
-        let hot_reload_state = hot_reload_state.clone();
-        async move {
-            match hot_reload_state.file_map.clone() {
-                Some(file_map) => {
-                    // The open interprocess sockets
-                    start_desktop_hot_reload(hot_reload_state, file_map).await?;
-                }
-                None => {
-                    std::future::pending::<()>().await;
-                }
-            }
-            Ok(())
-        }
-    });
-
     let platform = RwLock::new(P::start(&config, serve, Vec::new())?);
 
-    tracing::info!("🚀 Starting development server...");
-
-    // We got to own watcher so that it exists for the duration of serve
-    // Otherwise full reload won't work.
-    let _watcher = setup_file_watcher(
-        {
-            let config = config.clone();
-            let serve = serve.clone();
-            move || {
-                platform
-                    .write()
-                    .unwrap()
-                    .rebuild(&config, &serve, Vec::new())
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async move {
+        let hot_reload: tokio::task::JoinHandle<Result<()>> = tokio::spawn({
+            let hot_reload_state = hot_reload_state.clone();
+            async move {
+                match hot_reload_state.file_map.clone() {
+                    Some(file_map) => {
+                        // The open interprocess sockets
+                        start_desktop_hot_reload(hot_reload_state, file_map).await?;
+                    }
+                    None => {
+                        std::future::pending::<()>().await;
+                    }
+                }
+                Ok(())
             }
-        },
-        &config,
-        None,
-        hot_reload_state,
-    )
-    .await?;
+        });
 
-    hot_reload.await.unwrap()?;
+        tracing::info!("🚀 Starting development server...");
 
-    Ok(())
+        // We got to own watcher so that it exists for the duration of serve
+        // Otherwise full reload won't work.
+        let _watcher = setup_file_watcher(
+            {
+                let config = config.clone();
+                let serve = serve.clone();
+                move || {
+                    platform
+                        .write()
+                        .unwrap()
+                        .rebuild(&config, &serve, Vec::new())
+                }
+            },
+            &config,
+            None,
+            hot_reload_state,
+        )
+        .await?;
+
+        hot_reload.await.unwrap()?;
+        Ok(())
+    })
 }
 
 async fn start_desktop_hot_reload(
@@ -240,17 +242,11 @@ fn send_msg(msg: HotReloadMsg, channel: &mut impl std::io::Write) -> bool {
     }
 }
 
-fn start_desktop(
-    config: &CrateConfig,
-    skip_assets: bool,
-    rust_flags: Option<String>,
+fn run_desktop(
     args: &Vec<String>,
     env: Vec<(String, String)>,
+    result: BuildResult,
 ) -> Result<(RAIIChild, BuildResult)> {
-    // Run the desktop application
-    // Only used for the fullstack platform,
-    let result = crate::builder::build_desktop(config, true, skip_assets, rust_flags)?;
-
     let active = "DIOXUS_ACTIVE";
     let child = RAIIChild(
         Command::new(
@@ -278,13 +274,12 @@ impl DesktopPlatform {
     /// `rust_flags` argument is added because it is used by the
     /// `DesktopPlatform`'s implementation of the `Platform::start()`.
     pub fn start_with_options(
+        build_result: BuildResult,
         config: &CrateConfig,
         serve: &ConfigOptsServe,
-        rust_flags: Option<String>,
         env: Vec<(String, String)>,
     ) -> Result<Self> {
-        let (child, first_build_result) =
-            start_desktop(config, serve.skip_assets, rust_flags, &serve.args, env)?;
+        let (child, first_build_result) = run_desktop(&serve.args, env, build_result)?;
 
         tracing::info!("🚀 Starting development server...");
 
@@ -337,7 +332,9 @@ impl DesktopPlatform {
         // Todo: add a timeout here to kill the process if it doesn't shut down within a reasonable time
         self.currently_running_child.0.wait()?;
 
-        let (child, result) = start_desktop(config, self.skip_assets, rust_flags, &self.args, env)?;
+        let build_result =
+            crate::builder::build_desktop(config, true, self.skip_assets, rust_flags)?;
+        let (child, result) = run_desktop(&self.args, env, build_result)?;
         self.currently_running_child = child;
         Ok(result)
     }
@@ -349,11 +346,8 @@ impl Platform for DesktopPlatform {
         serve: &ConfigOptsServe,
         env: Vec<(String, String)>,
     ) -> Result<Self> {
-        // See `start_with_options()`'s docs for the explanation why the code
-        // was moved there.
-        // Since desktop platform doesn't use `rust_flags`, this argument is
-        // explicitly set to `None`.
-        DesktopPlatform::start_with_options(config, serve, None, env)
+        let build_result = crate::builder::build_desktop(config, true, serve.skip_assets, None)?;
+        DesktopPlatform::start_with_options(build_result, config, serve, env)
     }
 
     fn rebuild(

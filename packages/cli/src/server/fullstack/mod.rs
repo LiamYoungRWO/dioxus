@@ -5,7 +5,10 @@ use crate::{
     BuildResult, Result,
 };
 
-use super::{desktop, Platform};
+use super::{
+    desktop::{self, DesktopPlatform},
+    Platform,
+};
 
 static CLIENT_RUST_FLAGS: &str = "-C debuginfo=none -C strip=debuginfo";
 // The `opt-level=2` increases build times, but can noticeably decrease time
@@ -33,8 +36,8 @@ pub fn server_rust_flags(build: &ConfigOptsBuild) -> String {
     rust_flags(build, SERVER_RUST_FLAGS)
 }
 
-pub async fn startup(config: CrateConfig, serve: &ConfigOptsServe) -> Result<()> {
-    desktop::startup_with_platform::<FullstackPlatform>(config, serve).await
+pub fn startup(config: CrateConfig, serve: &ConfigOptsServe) -> Result<()> {
+    desktop::startup_with_platform::<FullstackPlatform>(config, serve)
 }
 
 fn start_web_build_thread(
@@ -49,7 +52,9 @@ fn start_web_build_thread(
 
 fn make_desktop_config(config: &CrateConfig, serve: &ConfigOptsServe) -> CrateConfig {
     let mut desktop_config = config.clone();
-    desktop_config.target_dir = config.server_target_dir();
+    if !serve.force_sequential {
+        desktop_config.target_dir = config.server_target_dir();
+    }
     let desktop_feature = serve.server_feature.clone();
     let features = &mut desktop_config.features;
     match features {
@@ -89,17 +94,21 @@ impl Platform for FullstackPlatform {
         let server_rust_flags = server_rust_flags(&serve.clone().into());
         let mut desktop_env = env.clone();
         add_serve_options_to_env(serve, &mut desktop_env);
-        let desktop = desktop::DesktopPlatform::start_with_options(
+        let build_result = crate::builder::build_desktop(
             &desktop_config,
-            serve,
+            true,
+            serve.skip_assets,
             Some(server_rust_flags.clone()),
-            desktop_env,
         )?;
         thread_handle
             .join()
             .map_err(|_| anyhow::anyhow!("Failed to join thread"))??;
 
-        if serve.open {
+        // Only start the server after the web build is finished
+        let desktop =
+            DesktopPlatform::start_with_options(build_result, &desktop_config, serve, desktop_env)?;
+
+        if serve.open.unwrap_or_default() {
             crate::server::web::open_browser(
                 config,
                 serve
@@ -157,7 +166,7 @@ fn build_web(serve: ConfigOptsServe, target_directory: &std::path::Path) -> Resu
     }
     .build(
         None,
-        Some(target_directory),
+        (!web_config.force_sequential).then_some(target_directory),
         Some(client_rust_flags(&web_config)),
     )
 }
