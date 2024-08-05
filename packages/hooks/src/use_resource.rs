@@ -28,7 +28,7 @@ where
         (rc, Rc::new(Cell::new(Some(changed))))
     });
 
-    let cb = use_callback(move || {
+    let cb = use_callback(move |_| {
         // Create the user's task
         let fut = rc.reset_and_run_in(&mut future);
 
@@ -54,7 +54,7 @@ where
         })
     });
 
-    let mut task = use_hook(|| Signal::new(cb()));
+    let mut task = use_hook(|| Signal::new(cb(())));
 
     use_hook(|| {
         let mut changed = changed.take().unwrap();
@@ -67,7 +67,7 @@ where
                 task.write().cancel();
 
                 // Start a new task
-                task.set(cb());
+                task.set(cb(()));
             }
         })
     });
@@ -110,7 +110,7 @@ pub struct Resource<T: 'static> {
     value: Signal<Option<T>>,
     task: Signal<Task>,
     state: Signal<UseResourceState>,
-    callback: UseCallback<Task>,
+    callback: UseCallback<(), Task>,
 }
 
 impl<T> PartialEq for Resource<T> {
@@ -174,7 +174,7 @@ impl<T> Resource<T> {
     /// ```
     pub fn restart(&mut self) {
         self.task.write().cancel();
-        let new_task = self.callback.call();
+        let new_task = self.callback.call(());
         self.task.set(new_task);
     }
 
@@ -441,8 +441,10 @@ impl<T> Readable for Resource<T> {
     }
 
     #[track_caller]
-    fn peek_unchecked(&self) -> ReadableRef<'static, Self> {
-        self.value.peek_unchecked()
+    fn try_peek_unchecked(
+        &self,
+    ) -> Result<ReadableRef<'static, Self>, generational_box::BorrowError> {
+        self.value.try_peek_unchecked()
     }
 }
 

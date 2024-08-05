@@ -1,5 +1,5 @@
 //! A shared pool of renderers for efficient server side rendering.
-use crate::streaming::StreamingRenderer;
+use crate::streaming::{Mount, StreamingRenderer};
 use dioxus_interpreter_js::INITIALIZE_STREAMING_JS;
 use dioxus_ssr::{
     incremental::{CachedRender, RenderFreshness},
@@ -7,14 +7,21 @@ use dioxus_ssr::{
 };
 use futures_channel::mpsc::Sender;
 use futures_util::{Stream, StreamExt};
+use std::sync::Arc;
 use std::sync::RwLock;
 use std::{collections::HashMap, future::Future};
-use std::{fmt::Write, sync::Arc};
 use tokio::task::JoinHandle;
 
 use crate::prelude::*;
 use dioxus_lib::prelude::*;
 
+/// A suspense boundary that is pending with a placeholder in the client
+struct PendingSuspenseBoundary {
+    mount: Mount,
+    children: Vec<ScopeId>,
+}
+
+/// Spawn a task in the background. If wasm is enabled, this will use the single threaded tokio runtime
 fn spawn_platform<Fut>(f: impl FnOnce() -> Fut + Send + 'static) -> JoinHandle<Fut::Output>
 where
     Fut: Future + 'static,
@@ -56,6 +63,7 @@ impl SsrRendererPool {
         }
     }
 
+    /// Look for a cached route in the incremental cache and send it into the render channel if it exists
     fn check_cached_route(
         &self,
         route: &str,
@@ -91,6 +99,8 @@ impl SsrRendererPool {
         None
     }
 
+    /// Render a virtual dom into a stream. This method will return immediately and continue streaming the result in the background
+    /// The streaming is canceled when the stream the function returns is dropped
     async fn render_to(
         self: Arc<Self>,
         cfg: &ServeConfig,
@@ -160,9 +170,7 @@ impl SsrRendererPool {
 
         let join_handle = spawn_platform(move || async move {
             let mut virtual_dom = virtual_dom_factory();
-            #[cfg(feature = "document")]
             let document = std::rc::Rc::new(crate::document::server::ServerDocument::default());
-            #[cfg(feature = "document")]
             virtual_dom.provide_root_context(document.clone() as std::rc::Rc<dyn Document>);
 
             // poll the future, which may call server_context()
@@ -171,31 +179,8 @@ impl SsrRendererPool {
 
             let mut pre_body = String::new();
 
-            if let Err(err) = wrapper.render_head(&mut pre_body) {
+            if let Err(err) = wrapper.render_head(&mut pre_body, &virtual_dom) {
                 _ = into.start_send(Err(err));
-                return;
-            }
-
-            #[cfg(feature = "document")]
-            {
-                // Collect any head content from the document provider and inject that into the head
-                if let Err(err) = document.render(&mut pre_body, &mut renderer) {
-                    _ = into.start_send(Err(err.into()));
-                    return;
-                }
-
-                // Enable a warning when inserting contents into the head during streaming
-                document.start_streaming();
-            }
-
-            if let Err(err) = wrapper.render_before_body(&mut pre_body) {
-                _ = into.start_send(Err(err));
-                return;
-            }
-            if let Err(err) = write!(&mut pre_body, "<script>{INITIALIZE_STREAMING_JS}</script>") {
-                _ = into.start_send(Err(
-                    dioxus_ssr::incremental::IncrementalRendererError::RenderError(err),
-                ));
                 return;
             }
 
@@ -206,6 +191,9 @@ impl SsrRendererPool {
             {
                 let scope_to_mount_mapping = scope_to_mount_mapping.clone();
                 let stream = stream.clone();
+                // We use a stack to keep track of what suspense boundaries we are nested in to add children to the correct boundary
+                // The stack starts with the root scope because the root is a suspense boundary
+                let pending_suspense_boundaries_stack = RwLock::new(vec![]);
                 renderer.set_render_components(move |renderer, to, vdom, scope| {
                     let is_suspense_boundary =
                         SuspenseContext::downcast_suspense_boundary_from_scope(
@@ -216,10 +204,47 @@ impl SsrRendererPool {
                         .is_some();
                     if is_suspense_boundary {
                         let mount = stream.render_placeholder(
-                            |to| renderer.render_scope(to, vdom, scope),
+                            |to| {
+                                {
+                                    pending_suspense_boundaries_stack
+                                        .write()
+                                        .unwrap()
+                                        .push(scope);
+                                }
+                                let out = renderer.render_scope(to, vdom, scope);
+                                {
+                                    pending_suspense_boundaries_stack.write().unwrap().pop();
+                                }
+                                out
+                            },
                             &mut *to,
                         )?;
-                        scope_to_mount_mapping.write().unwrap().insert(scope, mount);
+                        // Add the suspense boundary to the list of pending suspense boundaries
+                        // We will replace the mount with the resolved contents later once the suspense boundary is resolved
+                        let mut scope_to_mount_mapping_write =
+                            scope_to_mount_mapping.write().unwrap();
+                        scope_to_mount_mapping_write.insert(
+                            scope,
+                            PendingSuspenseBoundary {
+                                mount,
+                                children: vec![],
+                            },
+                        );
+                        // Add the scope to the list of children of the parent suspense boundary
+                        let pending_suspense_boundaries_stack =
+                            pending_suspense_boundaries_stack.read().unwrap();
+                        // If there is a parent suspense boundary, add the scope to the list of children
+                        // This suspense boundary will start capturing errors when the parent is resolved
+                        if let Some(parent) = pending_suspense_boundaries_stack.last() {
+                            let parent = scope_to_mount_mapping_write.get_mut(parent).unwrap();
+                            parent.children.push(scope);
+                        }
+                        // Otherwise this is a root suspense boundary, so we need to start capturing errors immediately
+                        else {
+                            vdom.in_runtime(|| {
+                                start_capturing_errors(scope);
+                            });
+                        }
                     } else {
                         renderer.render_scope(to, vdom, scope)?
                     }
@@ -237,15 +262,8 @@ impl SsrRendererPool {
             // Render the initial frame with loading placeholders
             let mut initial_frame = renderer.render(&virtual_dom);
 
-            // Collect the initial server data from the root node. For most apps, no use_server_futures will be resolved initially, so this will be full on `None`s.
-            // Sending down those Nones are still important to tell the client not to run the use_server_futures that are already running on the backend
-            let resolved_data = serialize_server_data(&virtual_dom, ScopeId::ROOT);
-            initial_frame.push_str(&format!(
-                r#"<script>window.initial_dioxus_hydration_data="{resolved_data}";</script>"#,
-            ));
-
             // Along with the initial frame, we render the html after the main element, but before the body tag closes. This should include the script that starts loading the wasm bundle.
-            if let Err(err) = wrapper.render_after_main(&mut initial_frame) {
+            if let Err(err) = wrapper.render_after_main(&mut initial_frame, &virtual_dom) {
                 throw_error!(err);
             }
             stream.render(initial_frame);
@@ -265,12 +283,12 @@ impl SsrRendererPool {
 
                 // Just rerender the resolved nodes
                 for scope in resolved_suspense_nodes {
-                    let mount = {
+                    let pending_suspense_boundary = {
                         let mut lock = scope_to_mount_mapping.write().unwrap();
                         lock.remove(&scope)
                     };
                     // If the suspense boundary was immediately removed, it may not have a mount. We can just skip resolving it
-                    if let Some(mount) = mount {
+                    if let Some(pending_suspense_boundary) = pending_suspense_boundary {
                         let mut resolved_chunk = String::new();
                         // After we replace the placeholder in the dom with javascript, we need to send down the resolved data so that the client can hydrate the node
                         let render_suspense = |into: &mut String| {
@@ -279,7 +297,7 @@ impl SsrRendererPool {
                         };
                         let resolved_data = serialize_server_data(&virtual_dom, scope);
                         if let Err(err) = stream.replace_placeholder(
-                            mount,
+                            pending_suspense_boundary.mount,
                             render_suspense,
                             resolved_data,
                             &mut resolved_chunk,
@@ -290,13 +308,22 @@ impl SsrRendererPool {
                         }
 
                         stream.render(resolved_chunk);
-                    }
-                    // Freeze the suspense boundary to prevent future reruns of any child nodes of the suspense boundary
-                    if let Some(suspense) = SuspenseContext::downcast_suspense_boundary_from_scope(
-                        &virtual_dom.runtime(),
-                        scope,
-                    ) {
-                        suspense.freeze();
+                        // Freeze the suspense boundary to prevent future reruns of any child nodes of the suspense boundary
+                        if let Some(suspense) =
+                            SuspenseContext::downcast_suspense_boundary_from_scope(
+                                &virtual_dom.runtime(),
+                                scope,
+                            )
+                        {
+                            suspense.freeze();
+                            // Go to every child suspense boundary and add an error boundary. Since we cannot rerun any nodes above the child suspense boundary,
+                            // we need to capture the errors and send them to the client as it resolves
+                            virtual_dom.in_runtime(|| {
+                                for &suspense_scope in pending_suspense_boundary.children.iter() {
+                                    start_capturing_errors(suspense_scope);
+                                }
+                            });
+                        }
                     }
                 }
             }
@@ -311,7 +338,7 @@ impl SsrRendererPool {
             // If incremental rendering is enabled, add the new render to the cache without the streaming bits
             if let Some(incremental) = &self.incremental_cache {
                 let mut cached_render = String::new();
-                if let Err(err) = wrapper.render_before_body(&mut cached_render) {
+                if let Err(err) = wrapper.render_head(&mut cached_render, &virtual_dom) {
                     throw_error!(err);
                 }
                 cached_render.push_str(&post_streaming);
@@ -335,6 +362,13 @@ impl SsrRendererPool {
             },
         ))
     }
+}
+
+/// Start capturing errors at a suspense boundary. If the parent suspense boundary is frozen, we need to capture the errors in the suspense boundary
+/// and send them to the client to continue bubbling up
+fn start_capturing_errors(suspense_scope: ScopeId) {
+    // Add an error boundary to the scope
+    suspense_scope.in_runtime(provide_error_boundary);
 }
 
 fn serialize_server_data(virtual_dom: &VirtualDom, scope: ScopeId) -> String {
@@ -401,22 +435,56 @@ impl FullstackHTMLTemplate {
     pub fn render_head<R: std::fmt::Write>(
         &self,
         to: &mut R,
+        virtual_dom: &VirtualDom,
     ) -> Result<(), dioxus_ssr::incremental::IncrementalRendererError> {
         let ServeConfig { index, .. } = &self.cfg;
 
-        to.write_str(&index.head)?;
+        let title = {
+            let document: Option<std::rc::Rc<dyn dioxus_lib::prelude::document::Document>> =
+                virtual_dom.in_runtime(|| ScopeId::ROOT.consume_context());
+            let document: Option<&crate::document::server::ServerDocument> = document
+                .as_ref()
+                .and_then(|document| document.as_any().downcast_ref());
+            // Collect any head content from the document provider and inject that into the head
+            document.and_then(|document| document.title())
+        };
+
+        to.write_str(&index.head_before_title)?;
+        if let Some(title) = title {
+            to.write_str(&title)?;
+        } else {
+            to.write_str(&index.title)?;
+        }
+        to.write_str(&index.head_after_title)?;
+
+        let document: Option<std::rc::Rc<dyn dioxus_lib::prelude::document::Document>> =
+            virtual_dom.in_runtime(|| ScopeId::ROOT.consume_context());
+        let document: Option<&crate::document::server::ServerDocument> = document
+            .as_ref()
+            .and_then(|document| document.as_any().downcast_ref());
+        if let Some(document) = document {
+            // Collect any head content from the document provider and inject that into the head
+            document.render(to)?;
+
+            // Enable a warning when inserting contents into the head during streaming
+            document.start_streaming();
+        }
+
+        self.render_before_body(to)?;
 
         Ok(())
     }
 
     /// Render any content before the body of the page.
-    pub fn render_before_body<R: std::fmt::Write>(
+    fn render_before_body<R: std::fmt::Write>(
         &self,
         to: &mut R,
     ) -> Result<(), dioxus_ssr::incremental::IncrementalRendererError> {
         let ServeConfig { index, .. } = &self.cfg;
 
         to.write_str(&index.close_head)?;
+
+        write!(to, "<script>{INITIALIZE_STREAMING_JS}</script>")?;
 
         Ok(())
     }
@@ -425,9 +493,17 @@ impl FullstackHTMLTemplate {
     pub fn render_after_main<R: std::fmt::Write>(
         &self,
         to: &mut R,
+        virtual_dom: &VirtualDom,
     ) -> Result<(), dioxus_ssr::incremental::IncrementalRendererError> {
         let ServeConfig { index, .. } = &self.cfg;
 
+        // Collect the initial server data from the root node. For most apps, no use_server_futures will be resolved initially, so this will be full on `None`s.
+        // Sending down those Nones are still important to tell the client not to run the use_server_futures that are already running on the backend
+        let resolved_data = serialize_server_data(virtual_dom, ScopeId::ROOT);
+        write!(
+            to,
+            r#"<script>window.initial_dioxus_hydration_data="{resolved_data}";</script>"#,
+        )?;
         to.write_str(&index.post_main)?;
 
         Ok(())
@@ -441,6 +517,21 @@ impl FullstackHTMLTemplate {
         let ServeConfig { index, .. } = &self.cfg;
 
         to.write_str(&index.after_closing_body_tag)?;
+
+        Ok(())
+    }
+
+    /// Wrap a body in the template
+    pub fn wrap_body<R: std::fmt::Write>(
+        &self,
+        to: &mut R,
+        virtual_dom: &VirtualDom,
+        body: impl std::fmt::Display,
+    ) -> Result<(), dioxus_ssr::incremental::IncrementalRendererError> {
+        self.render_head(to, virtual_dom)?;
+        write!(to, "{body}")?;
+        self.render_after_main(to, virtual_dom)?;
+        self.render_after_body(to)?;
 
         Ok(())
     }
