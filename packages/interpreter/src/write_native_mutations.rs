@@ -97,14 +97,17 @@ impl WriteMutations for MutationState {
     fn load_template(&mut self, template: Template, index: usize, id: dioxus_core::ElementId) {
         // Get the template or create it if we haven't seen it before
         let tmpl_id = self.templates.get(&template).cloned().unwrap_or_else(|| {
-            let current_max_template_count = self.templates.len() as u16;
+            let tmpl_id = self.templates.len() as u16;
+            self.templates.insert(template, tmpl_id);
+
             for root in template.roots.iter() {
                 self.create_template_node(root);
-                self.templates.insert(template, current_max_template_count);
             }
-            let id = template.roots.len() as u16;
-            self.channel.add_templates(current_max_template_count, id);
-            current_max_template_count
+
+            let len = template.roots.len() as u16;
+            self.channel.add_templates(tmpl_id, len);
+
+            tmpl_id
         });
 
         self.channel
@@ -187,5 +190,25 @@ impl WriteMutations for MutationState {
 
     fn push_root(&mut self, id: dioxus_core::ElementId) {
         self.channel.push_root(id.0 as _);
+    }
+}
+
+/// A synchronous response to a browser event which may prevent the default browser's action
+#[cfg_attr(feature = "serialize", derive(serde::Serialize))]
+#[derive(Default)]
+pub struct SynchronousEventResponse {
+    #[cfg(feature = "serialize")]
+    #[serde(rename = "preventDefault")]
+    prevent_default: bool,
+}
+
+impl SynchronousEventResponse {
+    /// Create a new SynchronousEventResponse
+    #[allow(unused)]
+    pub fn new(prevent_default: bool) -> Self {
+        Self {
+            #[cfg(feature = "serialize")]
+            prevent_default,
+        }
     }
 }

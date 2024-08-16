@@ -77,9 +77,10 @@ mod js {
     fn create_placeholder(id: u32) {
         "{let node = document.createComment('placeholder'); this.stack.push(node); this.nodes[$id$] = node;}"
     }
+
     fn new_event_listener(event_name: &str<u8, evt>, id: u32, bubbles: u8) {
         r#"
-            let node = this.nodes[id];
+            const node = this.nodes[id];
             if(node.listening){node.listening += 1;}else{node.listening = 1;}
             node.setAttribute('data-dioxus-id', `\${id}`);
             this.createListener($event_name$, node, $bubbles$);
@@ -185,7 +186,7 @@ mod js {
     // if this is a mounted listener, we send the event immediately
     if (event_name === "mounted") {
         window.ipc.postMessage(
-            this.serializeIpcMessage("user_event", {
+            this.sendSerializedEvent({
                 name: event_name,
                 element: id,
                 data: null,
